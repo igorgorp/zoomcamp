@@ -1,0 +1,229 @@
+id: 02_postgres_taxi
+namespace: zoomcamp
+
+
+variables:
+  bucket_name: "terraform-data-engineering-zoomcamp-terra-bucket" 
+
+tasks:
+
+
+  - id: namespace
+    type: io.kestra.plugin.core.namespace.DownloadFiles
+    namespace: zoomcamp
+    files:
+      - gcp-service-account-key.json
+
+  - id: extract_data
+    type: io.kestra.plugin.scripts.python.Script
+    beforeCommands:
+      - pip install pandas
+    outputFiles:
+      - "trips_data.csv"
+    script: |
+      import pandas as pd
+      
+      def extract_data(url):
+          try:
+              df = pd.read_csv(url, compression='gzip', low_memory=False)
+              return df
+          except Exception as e:
+              print(f"Error processing {url}: {str(e)}")
+              raise
+      
+      base_url = "https://github.com/DataTalksClub/nyc-tlc-data/releases/download/green/"
+      months = ["10", "11", "12"]
+      year = "2020"
+      
+      dfs = []
+      
+      for month in months:
+          url = f"{base_url}green_tripdata_{year}-{month}.csv.gz"
+          print(f"Processing: {url}")
+          df = extract_data(url)
+          dfs.append(df)
+          print(f"Completed processing {year}-{month}")
+      
+      trips_df = pd.concat(dfs, ignore_index=True)
+      trips_df.to_csv('trips_data.csv', index=False)
+
+  - id: transform_data
+    type: io.kestra.plugin.scripts.python.Script
+    beforeCommands:
+      - pip install pandas
+      - pip install fastparquet
+    inputFiles:
+      trips_data.csv: "{{ outputs.extract_data.outputFiles['trips_data.csv'] }}"
+    script: |
+      import pandas as pd
+      
+      trips_df = pd.read_csv('trips_data.csv', low_memory=False)
+      
+      trips_df = trips_df.loc[(trips_df['passenger_count'] > 0)]
+      trips_df = trips_df.loc[(trips_df['trip_distance'] > 0)]
+      trips_df['lpep_pickup_date'] = pd.to_datetime(trips_df['lpep_pickup_datetime']).dt.date.astype(str)
+      trips_df['lpep_dropoff_date'] = pd.to_datetime(trips_df['lpep_dropoff_datetime']).dt.date.astype(str)
+      
+      #convert to snake case
+      column_mapping = {
+          'VendorID': 'vendor_id',
+          'RatecodeID': 'ratecode_id',
+          'PULocationID': 'pu_location_id',
+          'DOLocationID': 'do_location_id',
+      }
+      
+      
+      trips_df = trips_df.rename(columns=column_mapping)
+      columns_to_keep = [
+          'vendor_id',
+          'lpep_pickup_datetime',
+          'lpep_dropoff_datetime',
+          'store_and_fwd_flag',
+          'passenger_count',
+          'trip_distance',
+          'pu_location_id',
+          'do_location_id',
+          'payment_type',
+          'fare_amount',
+          'extra',
+          'mta_tax',
+          'tip_amount',
+          'tolls_amount',
+          'improvement_surcharge',
+          'total_amount',
+          'congestion_surcharge',
+          'lpep_pickup_date',
+          'lpep_dropoff_date'
+      ]
+      
+      trips_df = trips_df[columns_to_keep]
+
+
+      # convert int columns
+      int_columns = ['vendor_id', 'passenger_count', 'pu_location_id', 'do_location_id', 'payment_type']
+      trips_df[int_columns] = trips_df[int_columns].astype(int)
+
+
+      # test data
+      allowed_vendor_ids = {1, 2}
+      assert trips_df['vendor_id'].isin(allowed_vendor_ids).all(), "Found invalid vendor_id values"
+      assert trips_df['passenger_count'].gt(0).all(), "Found trips with 0 or negative passenger count"
+      assert trips_df['trip_distance'].gt(0).all(), "Found trips with 0 or negative distance"
+      
+      
+      trips_df.to_csv('transformed_trips_data.csv', index=False)
+      trips_df.to_parquet('transformed_trips_data.parquet', index=False)
+
+    outputFiles:
+    - "transformed_trips_data.csv"
+    - "transformed_trips_data.parquet"
+
+  - id: create_schema
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    username: kestra
+    password: k3str4
+    url: "jdbc:postgresql://postgres:5432/kestra"
+    sql: |
+
+      CREATE SCHEMA IF NOT EXISTS mage;
+
+  - id: drop_create_table
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    username: kestra
+    password: k3str4
+    url: "jdbc:postgresql://postgres:5432/kestra"
+    sql: |
+
+      DROP TABLE IF EXISTS mage.green_taxi_data;
+      
+      
+      CREATE TABLE mage.green_taxi_data (
+          vendor_id INTEGER,
+          lpep_pickup_datetime TIMESTAMP,
+          lpep_dropoff_datetime TIMESTAMP,
+          store_and_fwd_flag TEXT,
+          passenger_count INTEGER,
+          trip_distance FLOAT,
+          pu_location_id INTEGER,
+          do_location_id INTEGER,
+          payment_type INTEGER,
+          fare_amount FLOAT,
+          extra FLOAT,
+          mta_tax FLOAT,
+          tip_amount FLOAT,
+          tolls_amount FLOAT,
+          improvement_surcharge FLOAT,
+          total_amount FLOAT,
+          congestion_surcharge FLOAT,
+          lpep_pickup_date DATE,
+          lpep_dropoff_date DATE
+      );
+
+  - id: load_data
+    type: io.kestra.plugin.jdbc.postgresql.CopyIn
+    username: kestra
+    password: k3str4
+    url: "jdbc:postgresql://postgres:5432/kestra"
+    table: "mage.green_taxi_data"
+    from: "{{ outputs.transform_data.outputFiles['transformed_trips_data.csv'] }}"
+    delimiter: ","
+    header: true
+
+  - id: upload_to_gcs_not_partitioned
+    type: io.kestra.plugin.gcp.gcs.Upload
+    from: "{{ outputs.transform_data.outputFiles['transformed_trips_data.parquet'] }}"
+    to: "gs://{{vars.bucket_name}}/transformed_trips_data.parquet"
+
+  - id: upload_to_gcs_partitioned
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    beforeCommands:
+      - pip install pandas pyarrow google-cloud-storage
+    inputFiles:
+      trips_data.parquet: "{{ outputs.transform_data.outputFiles['transformed_trips_data.parquet'] }}"
+      gcp-service-account-key.json: "{{ outputs.namespace.files['/gcp-service-account-key.json'] }}"
+    script: |
+      import pandas as pd
+      import pyarrow as pa
+      import pyarrow.parquet as pq
+      from pandas import DataFrame
+      import os
+      import sys
+
+
+      os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = 'gcp-service-account-key.json'
+
+      try:
+          df = pd.read_parquet('trips_data.parquet')
+          print(f"Loaded dataframe with shape: {df.shape}")
+          
+          df['lpep_pickup_datetime'] = pd.to_datetime(df['lpep_pickup_datetime'])
+          df['lpep_pickup_date'] = df['lpep_pickup_datetime'].dt.date
+          
+          table = pa.Table.from_pandas(df)
+          
+          gcs = pa.fs.GcsFileSystem()
+          
+          pq.write_to_dataset(
+              table,
+              root_path=f'{{vars.bucket_name}}/green_taxi_data',
+              partition_cols=['lpep_pickup_date'],
+              filesystem=gcs,
+              max_open_files=50,
+              compression='snappy'
+          )
+          print("Write completed successfully")
+
+      except Exception as e:
+          print(f"Error occurred: {str(e)}", file=sys.stderr)
+          raise e
+
+
+pluginDefaults:
+  - type: io.kestra.plugin.gcp
+    values:
+      serviceAccount: "{{kv('GCP_CREDS')}}"
+      projectId: "{{kv('GCP_PROJECT_ID')}}"
+      location: "{{kv('GCP_LOCATION')}}"
+      bucket: "{{kv('GCP_BUCKET_NAME')}}"

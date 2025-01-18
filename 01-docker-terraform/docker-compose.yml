@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      - POSTGRES_USER=root
+      - POSTGRES_PASSWORD=root
+      - POSTGRES_DB=ny_taxi
+    volumes:
+      - C:/temp/ny_taxi_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - pg-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U root -d ny_taxi"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pgadmin:
+    image: dpage/pgadmin4
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@admin.com
+      - PGADMIN_DEFAULT_PASSWORD=root
+    volumes:
+      - ./pgadmin-servers.json:/pgadmin4/servers.json
+      - C:/temp/pgadmin-data:/var/lib/pgadmin
+    ports:
+      - "8080:80"
+    networks:
+      - pg-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+networks:
+  pg-network:
+    driver: bridge
+    name: pg-network
